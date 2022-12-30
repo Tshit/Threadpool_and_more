@@ -16,9 +16,9 @@ class ThreadPool {
     //构建一个指定线程个数的thread pool对象
     explicit ThreadPool(std::size_t num_threads) {
         progress_trackers_.resize(num_threads);
-        // Create the worker threads.
+        // 创建工作线程
         for (std::size_t i = 0; i < num_threads; i++) {
-            worker_threads_.emplace_back([this] {
+            worker_threads_[i] = std::thread([this, i] {
                 while (true) {
                     std::function<void()> task;
                     {
@@ -54,7 +54,7 @@ class ThreadPool {
     }
     // 将一个任务添加进队列. 返回std::future用来存放任务的返回结果
     template <typename F>
-    std::future<typename std::result_of<F()>::type> AddTask(F&& task) {
+    std::future<typename std::result_of<F()>::type> AddTask(F&& task , size_t thread_index) {
         // 创建一个packaged_task用于包装任务
         std::packaged_task<typename std::result_of<F()>::type()> pt(std::forward<F>(task));
         // 获取与packaged_task相关的future
@@ -80,7 +80,7 @@ class ThreadPool {
         std::lock_guard<std::mutex> lock(mutex_);
         stop_ = true;
         
-        // Record the current position in the ProgressTracker objects.
+        // 在ProgressTracker对象中记录当前上传量
         for (std::size_t i = 0; i < progress_trackers_.size(); ++i) {
             progress_trackers_[i].RecordPosition();
         }
@@ -118,6 +118,14 @@ public:
     void RecordPosition() {
         std::lock_guard<std::mutex> lock(mutex_);
         recorded_position_ = current_position_;
+        auto thread_name = name_;
+        //将线程名,记录位置写入临时文件(json?)
+    }
+
+    // 获取记录的位置.
+    std::size_t GetRecordedPosition() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return recorded_position_;
     }
 
 private:
@@ -129,59 +137,33 @@ private:
 };
 
 int main() {
-    // Create a thread pool with 4 worker threads.
+    // 创建一个ThreadPool对象，有4个工作线程
     ThreadPool thread_pool(4);
 
-    // Determine the size of the file to download.
-    std::size_t size = 0;  // Replace this with code to determine the size of the file.
-    ProgressTracker progress_tracker("thread1", size);
+    // 为每一个工作线程创建一个ProgressTracker
+    std::vector<ProgressTracker> progress_trackers(4);
 
-    // Download the file in blocks of 4KB.
-    constexpr std::size_t block_size = 4 * 1024;
-    std::vector<std::future<std::vector<char>>> futures;
-    std::size_t position = 0;
-    while (position < size) {
-        std::size_t download_size = std::min(block_size, size - position);
-        futures.push_back(thread_pool.AddTask([&position, download_size, &progress_tracker] {
-            // Download the block of data here...
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));  // Simulate download time
-        position += download_size;  // Update the position
-        progress_tracker.UpdatePosition(download_size);  // Update the progress tracker
-        return std::vector<char>(download_size);
-            }));
+    // 将上传任务加入线程池
+    for (std::size_t i = 0; i < 4; ++i) {
+        thread_pool.AddTask([&progress_trackers, i] {
+            // Download a chunk of the file.
+            std::size_t bytes_transferred = UploadChunk(i);
+
+        // Update the ProgressTracker for this worker thread.
+        progress_trackers[i].UpdatePosition(bytes_transferred);
+            }, i);
     }
 
-    // Wait for the tasks to complete and write the downloaded data to the output file.
-    std::ofstream output("output.txt", std::ios::binary);
-    if (!output) {
-        std::cerr << "Error: failed to open output file." << std::endl;
-        return EXIT_FAILURE;
-    }
-    while (!futures.empty()) {
+    // 等待任务结束
+    thread_pool.Stop();
 
-        // Wait for the tasks to completeand write the downloaded data to the output file.
-        std::ofstream output("output.txt", std::ios::binary);
-        if (!output) {
-            std::cerr << "Error: failed to open output file." << std::endl;
-            return EXIT_FAILURE;
-        }
-        while (!futures.empty()) {
-            // Wait for any of the tasks to complete.
-            auto it = std::find_if(futures.begin(), futures.end(), [](const auto& future) { return future.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
-            if (it == futures.end()) {
-                // Sleep for a short time and print the progress.
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                std::size_t position = progress_tracker.GetPosition();
-                std::size_t total_size = progress_tracker.GetSize();
-                std::cout << "Progress: " << position << " / " << total_size << " (" << static_cast<double>(position) / total_size * 100 << "%)" << std::endl;
-                continue;
-            }
-            // Get the result of the completed task and write it to the output file.
-            std::vector<char> block = it->get();
-            output.write(block.data(), block.size());
-            futures.erase(it);
-        }
-
-        return 0;
+    // 计算总上传量
+    std::size_t total_bytes_transferred = 0;
+    for (std::size_t i = 0; i < 4; i++) {
+        total_bytes_transferred += progress_trackers[i].GetRecordedPosition();
     }
+
+    std::cout << "总上传量: " << total_bytes_transferred << std::endl;
+
+    return 0;
 }
